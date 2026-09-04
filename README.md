@@ -105,7 +105,7 @@ The exact repository structure may be updated as the implementation is further o
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/HVNet.git
+git clone https://github.com/suoqiu061/HVNet.git
 cd HVNet
 ```
 
