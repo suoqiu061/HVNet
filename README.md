@@ -31,6 +31,10 @@ Rather than combining the two modalities only through conventional parallel enco
 
 ## 🧠 Architecture
 
+<p align="center">
+  <img src="assets/HVNet.png" width="95%">
+</p>
+
 The main components of HVNet are:
 
 - **Clinical Hypothesis Encoder**
