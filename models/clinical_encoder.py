@@ -413,7 +413,7 @@ if __name__ == "__main__":
         num_heads=4,
         num_layers=2,
         feedforward_dim=128,
-        clinical_feature_dim=128,
+        clinical_feature_dim=256,
         dropout=0.1,
     )
 
