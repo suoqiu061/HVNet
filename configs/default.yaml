@@ -1,0 +1,418 @@
+# ============================================================
+# HVNet Default Configuration
+# Hypothesis-and-Verify Network for Three-Class Glaucoma Triage
+# ============================================================
+
+experiment:
+  name: "HVNet"
+  task: "three_class_glaucoma_triage"
+  description: >
+    Hypothesis-and-Verify Network integrating a color fundus photograph
+    with three structured clinical indicators (IOP, ACD, and CAG)
+    for three-class glaucoma triage.
+
+  seed: 42
+  num_classes: 3
+  class_names:
+    - "Normal"
+    - "OAG"
+    - "ACG"
+
+
+# ============================================================
+# Data
+# ============================================================
+
+data:
+  # Replace these paths with local paths when running experiments.
+  # Do NOT upload patient-level clinical data to the public repository.
+  root_dir: null
+  metadata_file: null
+
+  image_column: "image_path"
+  patient_id_column: "patient_id"
+  label_column: "label"
+
+  clinical_columns:
+    - "iop"
+    - "acd"
+    - "cag"
+
+  image_size: 224
+
+  # Patient-level partitioning is required to prevent data leakage.
+  split:
+    unit: "patient"
+    internal_development_ratio: 0.80
+    internal_test_ratio: 0.20
+    num_folds: 5
+    shuffle: true
+    seed: 42
+
+  # Study cohort sizes reported in the manuscript.
+  cohort:
+    internal_total_eyes: 2281
+    internal_total_patients: 1402
+
+    development_eyes: 1825
+    internal_test_eyes: 456
+
+    heldout_referral_eyes: 279
+    heldout_referral_patients: 179
+
+
+# ============================================================
+# Structured Clinical Inputs
+# ============================================================
+
+clinical:
+  indicators:
+    - name: "IOP"
+      description: "Intraocular pressure status"
+      type: "binary"
+      threshold_mmHg: 21
+
+    - name: "ACD"
+      description: "SLE-derived anterior chamber depth"
+      type: "binary"
+      categories:
+        - "normal"
+        - "shallow"
+
+    - name: "CAG"
+      description: "Van Herick-based chamber-angle grade"
+      type: "ordinal"
+      min_grade: 0
+      max_grade: 4
+
+  # In schematic figures and selected ablation settings,
+  # this structured clinical branch may be labeled as "Text".
+  schematic_label: "Text"
+
+  free_text_input: false
+
+
+# ============================================================
+# Model
+# ============================================================
+
+model:
+  name: "HVNet"
+
+  backbone:
+    name: "convnext_tiny"
+    pretrained: true
+    pretrained_source: "ImageNet-1K"
+
+  clinical_encoder:
+    type: "transformer"
+
+  visual_verification:
+    module: "MGVA"
+    full_name: "Multi-Granularity Visual Attention"
+
+    global_branch:
+      enabled: true
+      hypothesis_guided_attention: true
+
+    local_branch:
+      enabled: true
+      saliency_guided_sampling: true
+      num_local_patches: 4
+
+  evidential_learning:
+    enabled: true
+    evidence_activation: "softplus"
+
+  ds_fusion:
+    enabled: true
+    temperature: 1.0
+
+  confidence_gate:
+    enabled: true
+    adaptive: true
+
+    # Output order:
+    # [clinical branch, visual branch, DS-fusion branch]
+    output_order:
+      - "clinical"
+      - "visual"
+      - "ds"
+
+    output_bias_init:
+      - 1.0
+      - -0.5
+      - -0.5
+
+    normalize_weights: "softmax"
+
+
+# ============================================================
+# Prediction Branches
+# ============================================================
+
+prediction:
+  branches:
+    clinical:
+      enabled: true
+      symbol: "p_clin"
+
+    visual:
+      enabled: true
+      symbol: "p_vis"
+
+    ds:
+      enabled: true
+      symbol: "p_ds"
+
+  final:
+    symbol: "p_final"
+    fusion: "sample_adaptive_confidence_gate"
+
+  num_classes: 3
+
+
+# ============================================================
+# Loss Function
+# ============================================================
+
+loss:
+  primary:
+    name: "cross_entropy"
+    weight: 1.0
+
+  auxiliary:
+    enabled: true
+    name: "cross_entropy"
+    branches:
+      - "clinical"
+      - "visual"
+    weight: 0.3
+
+  evidential:
+    enabled: true
+    regularization: "dirichlet_kl"
+    branches:
+      - "clinical"
+      - "visual"
+    weight: 0.1
+
+  # Overall objective:
+  #
+  # L =
+  # CE(p_final, y)
+  # + lambda_aux * [CE(p_clin, y) + CE(p_vis, y)]
+  # + lambda_edl * [KL_clin + KL_vis]
+
+
+# ============================================================
+# Optimization
+# ============================================================
+
+optimizer:
+  name: "AdamW"
+
+  beta1: 0.9
+  beta2: 0.999
+
+  weight_decay: 0.01
+
+  learning_rates:
+    backbone: 5.0e-5
+    remaining_modules: 5.0e-4
+
+
+# ============================================================
+# Learning-Rate Scheduler
+# ============================================================
+
+scheduler:
+  name: "CosineAnnealingLR"
+  eta_min: 5.0e-7
+
+
+# ============================================================
+# Training
+# ============================================================
+
+training:
+  epochs: 80
+  batch_size: 32
+
+  freeze_backbone:
+    enabled: true
+    epochs: 5
+
+  gradient_clipping:
+    enabled: true
+    max_norm: 5.0
+
+  checkpoint_selection:
+    metric: "validation_accuracy"
+    mode: "max"
+
+  cross_validation:
+    enabled: true
+    num_folds: 5
+    patient_level: true
+
+  device: "cuda"
+
+  hardware:
+    gpu: "NVIDIA GeForce RTX 4090"
+    num_gpus: 1
+
+  software:
+    os: "Ubuntu 20.04"
+    pytorch: "2.1"
+
+
+# ============================================================
+# Image Preprocessing
+# ============================================================
+
+preprocessing:
+  resize:
+    height: 224
+    width: 224
+
+  normalization:
+    type: "ImageNet"
+    mean:
+      - 0.485
+      - 0.456
+      - 0.406
+    std:
+      - 0.229
+      - 0.224
+      - 0.225
+
+
+# ============================================================
+# Data Augmentation
+# ============================================================
+
+augmentation:
+  train:
+    horizontal_flip:
+      enabled: true
+
+    color_jitter:
+      enabled: true
+
+    rand_augment:
+      enabled: true
+
+    random_erasing:
+      enabled: true
+
+    random_resized_crop:
+      enabled: true
+      scale:
+        - 0.70
+        - 1.00
+
+  validation:
+    enabled: false
+
+  test:
+    enabled: false
+
+
+# ============================================================
+# Evaluation
+# ============================================================
+
+evaluation:
+  num_classes: 3
+
+  metrics:
+    - "accuracy"
+    - "specificity"
+    - "auc"
+    - "cohen_kappa"
+
+  specificity:
+    averaging: "macro"
+    strategy: "one_vs_rest"
+
+  auc:
+    averaging: "macro"
+    strategy: "one_vs_rest"
+
+  report:
+    aggregate_across_folds: true
+    statistics:
+      - "mean"
+      - "standard_deviation"
+
+  cohorts:
+    internal_test:
+      enabled: true
+      use_for_training: false
+      use_for_validation: false
+      use_for_checkpoint_selection: false
+
+    heldout_community_referral:
+      enabled: true
+      use_for_training: false
+      use_for_validation: false
+      use_for_checkpoint_selection: false
+
+
+# ============================================================
+# Checkpoints
+# ============================================================
+
+checkpoint:
+  save_dir: "./checkpoints"
+  save_best_only: true
+
+  monitor: "validation_accuracy"
+  mode: "max"
+
+  filename_template: "hvnet_fold{fold}_best.pth"
+
+
+# ============================================================
+# Output
+# ============================================================
+
+output:
+  results_dir: "./results"
+  predictions_dir: "./results/predictions"
+  logs_dir: "./logs"
+
+  save_predictions: true
+  save_probabilities: true
+  save_metrics: true
+
+
+# ============================================================
+# Logging
+# ============================================================
+
+logging:
+  enabled: true
+  print_frequency: 20
+
+  tensorboard:
+    enabled: false
+
+  save_training_log: true
+
+
+# ============================================================
+# Reproducibility
+# ============================================================
+
+reproducibility:
+  seed: 42
+
+  # Exact deterministic behavior may depend on CUDA,
+  # PyTorch version, and specific GPU operations.
+  deterministic: false
+
+  patient_level_split: true
+
+  prevent_test_leakage: true
