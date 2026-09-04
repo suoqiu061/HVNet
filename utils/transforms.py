@@ -1,661 +1,590 @@
 """
-Loss functions for HVNet.
+Image preprocessing and augmentation utilities for HVNet.
 
-This module implements the training objective described in the manuscript:
+This module implements the CFP preprocessing protocol described in the
+HVNet manuscript.
 
-    L =
-        CE(p_final, y)
-        +
-        lambda_aux * [
-            CE(p_clin, y)
-            +
-            CE(p_vis, y)
-        ]
-        +
-        lambda_edl * [
-            KL_c
-            +
-            KL_v
-        ]
+Training preprocessing
+----------------------
 
-where:
+The training pipeline includes:
 
-    p_final : final HVNet predictive distribution
-    p_clin  : clinical-branch predictive distribution
-    p_vis   : visual-branch predictive distribution
+    1. RandomResizedCrop to 224 x 224
+       scale = [0.70, 1.00]
 
-    KL_c    : Dirichlet evidential regularization for the clinical branch
-    KL_v    : Dirichlet evidential regularization for the visual branch
+    2. Random horizontal flipping
 
-The clinical and visual branches construct Dirichlet concentration
-parameters as:
+    3. ColorJitter
 
-    alpha_clin = softplus(z_c) + 1
+    4. RandAugment
 
-    alpha_vis  = softplus(z_v) + 1
+    5. Conversion to tensor
 
-The KL term regularizes the corresponding Dirichlet distribution toward
-a uniform Dirichlet prior:
+    6. ImageNet normalization
 
-    Dir(1, ..., 1)
+    7. RandomErasing
 
-Unless the original experimental implementation used a different
-Dirichlet KL formulation, this direct KL-to-uniform formulation should
-be retained consistently across code and manuscript.
+
+Validation / test preprocessing
+-------------------------------
+
+Validation and test images are processed deterministically using:
+
+    1. Resize to 224 x 224
+
+    2. Conversion to tensor
+
+    3. ImageNet normalization
+
+
+Important
+---------
+
+The manuscript explicitly specifies:
+
+    - image size = 224 x 224
+    - RandomResizedCrop scale = [0.70, 1.00]
+    - horizontal flipping
+    - ColorJitter
+    - RandAugment
+    - RandomErasing
+    - ImageNet normalization
+
+The exact numerical strengths/probabilities of ColorJitter,
+RandAugment, horizontal flipping, and RandomErasing should match the
+original experimental implementation before the repository is finalized.
+
+The current defaults for parameters not explicitly specified in the
+manuscript are operational defaults and can be overwritten through the
+function arguments.
 """
 
-from typing import Dict
+from typing import Dict, Optional, Sequence, Tuple
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from torchvision import transforms
 
 
 # ======================================================================
-# Probability-based cross entropy
+# ImageNet normalization
+# ======================================================================
+
+IMAGENET_MEAN = (
+    0.485,
+    0.456,
+    0.406,
+)
+
+IMAGENET_STD = (
+    0.229,
+    0.224,
+    0.225,
+)
+
+
+# ======================================================================
+# Default manuscript-level parameters
+# ======================================================================
+
+DEFAULT_IMAGE_SIZE = 224
+
+# Explicitly reported in the manuscript.
+DEFAULT_RANDOM_CROP_SCALE = (
+    0.70,
+    1.00,
+)
+
+
+# ======================================================================
+# Training transform
 # ======================================================================
 
 
-def probability_cross_entropy(
-    probabilities: torch.Tensor,
-    targets: torch.Tensor,
-    eps: float = 1e-8,
-    reduction: str = "mean",
-) -> torch.Tensor:
+def build_train_transform(
+    image_size: int = DEFAULT_IMAGE_SIZE,
+    crop_scale: Tuple[float, float] = DEFAULT_RANDOM_CROP_SCALE,
+
+    horizontal_flip_prob: float = 0.5,
+
+    color_jitter_brightness: float = 0.2,
+    color_jitter_contrast: float = 0.2,
+    color_jitter_saturation: float = 0.2,
+    color_jitter_hue: float = 0.05,
+
+    randaugment_num_ops: int = 2,
+    randaugment_magnitude: int = 9,
+
+    random_erasing_prob: float = 0.25,
+    random_erasing_scale: Tuple[float, float] = (0.02, 0.20),
+    random_erasing_ratio: Tuple[float, float] = (
+        0.3,
+        3.3,
+    ),
+
+    imagenet_mean: Sequence[float] = IMAGENET_MEAN,
+    imagenet_std: Sequence[float] = IMAGENET_STD,
+) -> transforms.Compose:
     """
-    Cross-entropy loss for an already normalized predictive distribution.
-
-    Implements:
-
-        CE(p, y) = -log(p_y)
-
-    This function should be used instead of nn.CrossEntropyLoss when
-    the input is already a probability distribution produced by
-    softmax.
+    Build the training-time CFP preprocessing pipeline.
 
     Parameters
     ----------
-    probabilities : torch.Tensor
-        Predictive probabilities.
-        Shape: [B, K].
+    image_size : int
+        Final image size.
 
-    targets : torch.Tensor
-        Integer target labels.
-        Shape: [B].
+        Manuscript configuration:
+            224
 
-    eps : float
-        Numerical stability constant.
+    crop_scale : tuple of float
+        Scale range used by RandomResizedCrop.
 
-    reduction : str
-        Reduction mode:
-            "mean"
-            "sum"
-            "none"
+        Manuscript configuration:
+            (0.70, 1.00)
+
+    horizontal_flip_prob : float
+        Probability of horizontal flipping.
+
+        The manuscript reports horizontal flipping but does not
+        explicitly specify the probability in the current Methods text.
+
+    color_jitter_brightness : float
+        Brightness strength for ColorJitter.
+
+    color_jitter_contrast : float
+        Contrast strength for ColorJitter.
+
+    color_jitter_saturation : float
+        Saturation strength for ColorJitter.
+
+    color_jitter_hue : float
+        Hue strength for ColorJitter.
+
+    randaugment_num_ops : int
+        Number of RandAugment operations.
+
+    randaugment_magnitude : int
+        RandAugment magnitude.
+
+    random_erasing_prob : float
+        Probability of RandomErasing.
+
+    random_erasing_scale : tuple
+        Area scale used by RandomErasing.
+
+    random_erasing_ratio : tuple
+        Aspect-ratio range used by RandomErasing.
+
+    imagenet_mean : sequence
+        ImageNet normalization mean.
+
+    imagenet_std : sequence
+        ImageNet normalization standard deviation.
 
     Returns
     -------
-    torch.Tensor
-        Cross-entropy loss.
+    torchvision.transforms.Compose
+        Training transform pipeline.
     """
 
-    if probabilities.ndim != 2:
+    # --------------------------------------------------------------
+    # Validation
+    # --------------------------------------------------------------
+
+    if image_size <= 0:
         raise ValueError(
-            "probabilities must have shape [B, K], "
-            f"but received {tuple(probabilities.shape)}."
+            "image_size must be greater than zero."
         )
 
-    if targets.ndim == 2 and targets.size(1) == 1:
-        targets = targets.squeeze(1)
-
-    if targets.ndim != 1:
+    if (
+        len(crop_scale) != 2
+        or crop_scale[0] <= 0
+        or crop_scale[1] <= 0
+        or crop_scale[0] > crop_scale[1]
+    ):
         raise ValueError(
-            "targets must have shape [B] or [B, 1], "
-            f"but received {tuple(targets.shape)}."
+            "crop_scale must be a valid (min, max) tuple."
         )
 
-    if probabilities.size(0) != targets.size(0):
+    if not 0.0 <= horizontal_flip_prob <= 1.0:
         raise ValueError(
-            "probabilities and targets must have the same batch size."
+            "horizontal_flip_prob must lie in [0, 1]."
         )
 
-    targets = targets.long()
-
-    num_classes = probabilities.size(1)
-
-    if targets.numel() > 0:
-        target_min = int(targets.min().item())
-        target_max = int(targets.max().item())
-
-        if target_min < 0 or target_max >= num_classes:
-            raise ValueError(
-                f"Target labels must lie in [0, {num_classes - 1}], "
-                f"but observed [{target_min}, {target_max}]."
-            )
-
-    # Numerical stabilization.
-    probabilities = probabilities.clamp(
-        min=eps,
-        max=1.0,
-    )
-
-    log_probabilities = torch.log(
-        probabilities
-    )
-
-    # Equivalent to:
-    #
-    #   -log(p_y)
-    #
-    loss = F.nll_loss(
-        log_probabilities,
-        targets,
-        reduction=reduction,
-    )
-
-    return loss
-
-
-# ======================================================================
-# Dirichlet KL divergence
-# ======================================================================
-
-
-def dirichlet_kl_divergence(
-    alpha: torch.Tensor,
-    prior_alpha: torch.Tensor,
-) -> torch.Tensor:
-    """
-    Compute KL divergence between two Dirichlet distributions.
-
-    Implements:
-
-        KL(
-            Dir(alpha)
-            ||
-            Dir(prior_alpha)
-        )
-
-    Parameters
-    ----------
-    alpha : torch.Tensor
-        Dirichlet concentration parameters.
-        Shape: [B, K].
-
-    prior_alpha : torch.Tensor
-        Prior Dirichlet concentration parameters.
-
-        Accepted shapes:
-            [K]
-            [1, K]
-            [B, K]
-
-    Returns
-    -------
-    torch.Tensor
-        KL divergence for each sample.
-        Shape: [B].
-    """
-
-    if alpha.ndim != 2:
+    if not 0.0 <= random_erasing_prob <= 1.0:
         raise ValueError(
-            "alpha must have shape [B, K]."
-        )
-
-    if prior_alpha.ndim == 1:
-        prior_alpha = prior_alpha.unsqueeze(0)
-
-    if prior_alpha.ndim != 2:
-        raise ValueError(
-            "prior_alpha must have shape [K], [1, K], or [B, K]."
-        )
-
-    if prior_alpha.size(1) != alpha.size(1):
-        raise ValueError(
-            "alpha and prior_alpha must contain the same "
-            "number of classes."
-        )
-
-    if prior_alpha.size(0) == 1:
-        prior_alpha = prior_alpha.expand(
-            alpha.size(0),
-            -1,
-        )
-
-    elif prior_alpha.size(0) != alpha.size(0):
-        raise ValueError(
-            "prior_alpha batch size must be either 1 "
-            "or equal to alpha batch size."
-        )
-
-    if torch.any(alpha <= 0):
-        raise ValueError(
-            "All Dirichlet alpha values must be positive."
-        )
-
-    if torch.any(prior_alpha <= 0):
-        raise ValueError(
-            "All prior Dirichlet alpha values must be positive."
+            "random_erasing_prob must lie in [0, 1]."
         )
 
     # --------------------------------------------------------------
-    # Sum of concentration parameters
+    # Training augmentation
     # --------------------------------------------------------------
 
-    alpha_0 = alpha.sum(
-        dim=-1,
-        keepdim=True,
-    )
+    train_transform = transforms.Compose(
+        [
+            # ======================================================
+            # Random resized crop
+            #
+            # Manuscript:
+            #
+            # scale = 0.7 -- 1.0
+            # output = 224 x 224
+            # ======================================================
 
-    prior_alpha_0 = prior_alpha.sum(
-        dim=-1,
-        keepdim=True,
-    )
+            transforms.RandomResizedCrop(
+                size=(
+                    image_size,
+                    image_size,
+                ),
+                scale=crop_scale,
+            ),
 
-    # --------------------------------------------------------------
-    # KL(Dir(alpha) || Dir(beta))
-    #
-    # log Gamma(sum alpha)
-    # - sum log Gamma(alpha_k)
-    #
-    # - log Gamma(sum beta)
-    # + sum log Gamma(beta_k)
-    #
-    # + sum_k [
-    #     (alpha_k - beta_k)
-    #     (
-    #       digamma(alpha_k)
-    #       - digamma(sum alpha)
-    #     )
-    #   ]
-    # --------------------------------------------------------------
+            # ======================================================
+            # Horizontal flip
+            # ======================================================
 
-    log_normalizer_alpha = (
-        torch.lgamma(alpha_0)
-        - torch.lgamma(alpha).sum(
-            dim=-1,
-            keepdim=True,
-        )
-    )
+            transforms.RandomHorizontalFlip(
+                p=horizontal_flip_prob
+            ),
 
-    log_normalizer_prior = (
-        torch.lgamma(prior_alpha_0)
-        - torch.lgamma(prior_alpha).sum(
-            dim=-1,
-            keepdim=True,
-        )
-    )
+            # ======================================================
+            # Color jitter
+            # ======================================================
 
-    expectation_term = (
-        (alpha - prior_alpha)
-        * (
-            torch.digamma(alpha)
-            - torch.digamma(alpha_0)
-        )
-    ).sum(
-        dim=-1,
-        keepdim=True,
-    )
+            transforms.ColorJitter(
+                brightness=color_jitter_brightness,
+                contrast=color_jitter_contrast,
+                saturation=color_jitter_saturation,
+                hue=color_jitter_hue,
+            ),
 
-    kl = (
-        log_normalizer_alpha
-        - log_normalizer_prior
-        + expectation_term
-    )
+            # ======================================================
+            # RandAugment
+            #
+            # Applied while the image is still in PIL format.
+            # ======================================================
 
-    return kl.squeeze(-1)
+            transforms.RandAugment(
+                num_ops=randaugment_num_ops,
+                magnitude=randaugment_magnitude,
+            ),
 
+            # ======================================================
+            # PIL -> Tensor
+            #
+            # [H, W, C]
+            #       ->
+            # [C, H, W]
+            #
+            # pixel range:
+            # 0--255 -> 0--1
+            # ======================================================
 
-# ======================================================================
-# Uniform-prior EDL regularization
-# ======================================================================
+            transforms.ToTensor(),
 
+            # ======================================================
+            # ImageNet normalization
+            # ======================================================
 
-def evidential_kl_loss(
-    alpha: torch.Tensor,
-    reduction: str = "mean",
-) -> torch.Tensor:
-    """
-    Dirichlet evidential KL regularization.
+            transforms.Normalize(
+                mean=imagenet_mean,
+                std=imagenet_std,
+            ),
 
-    The prior is the uniform Dirichlet distribution:
+            # ======================================================
+            # Random erasing
+            #
+            # Must be applied after conversion to tensor.
+            # ======================================================
 
-        beta = [1, 1, ..., 1]
-
-    Therefore:
-
-        KL =
-            KL(
-                Dir(alpha)
-                ||
-                Dir(1)
-            )
-
-    Parameters
-    ----------
-    alpha : torch.Tensor
-        Dirichlet concentration parameters.
-        Shape: [B, K].
-
-    reduction : str
-        Reduction mode:
-            "mean"
-            "sum"
-            "none"
-
-    Returns
-    -------
-    torch.Tensor
-        Evidential KL loss.
-    """
-
-    if alpha.ndim != 2:
-        raise ValueError(
-            "alpha must have shape [B, K]."
-        )
-
-    prior_alpha = torch.ones_like(
-        alpha
-    )
-
-    kl = dirichlet_kl_divergence(
-        alpha=alpha,
-        prior_alpha=prior_alpha,
-    )
-
-    if reduction == "mean":
-        return kl.mean()
-
-    if reduction == "sum":
-        return kl.sum()
-
-    if reduction == "none":
-        return kl
-
-    raise ValueError(
-        "reduction must be 'mean', 'sum', or 'none'."
-    )
-
-
-# ======================================================================
-# Complete HVNet objective
-# ======================================================================
-
-
-class HVNetLoss(nn.Module):
-    """
-    Complete HVNet training objective.
-
-    Implements:
-
-        L =
-            CE(p_final, y)
-
-            + lambda_aux * [
-                CE(p_clin, y)
-                +
-                CE(p_vis, y)
-            ]
-
-            + lambda_edl * [
-                KL_c
-                +
-                KL_v
-            ]
-
-    Manuscript configuration:
-
-        lambda_aux = 0.3
-        lambda_edl = 0.1
-
-    Parameters
-    ----------
-    lambda_aux : float
-        Auxiliary classification loss weight.
-
-    lambda_edl : float
-        Dirichlet evidential KL regularization weight.
-
-    eps : float
-        Numerical stability constant for probability-based CE.
-    """
-
-    def __init__(
-        self,
-        lambda_aux: float = 0.3,
-        lambda_edl: float = 0.1,
-        eps: float = 1e-8,
-    ) -> None:
-        super().__init__()
-
-        if lambda_aux < 0:
-            raise ValueError(
-                "lambda_aux must be non-negative."
-            )
-
-        if lambda_edl < 0:
-            raise ValueError(
-                "lambda_edl must be non-negative."
-            )
-
-        if eps <= 0:
-            raise ValueError(
-                "eps must be greater than zero."
-            )
-
-        self.lambda_aux = lambda_aux
-        self.lambda_edl = lambda_edl
-        self.eps = eps
-
-    def forward(
-        self,
-        outputs: Dict[str, torch.Tensor],
-        targets: torch.Tensor,
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Compute the complete HVNet loss.
-
-        Parameters
-        ----------
-        outputs : dict
-            Output dictionary returned by models/hvnet.py.
-
-            Required entries:
-
-                p_final
-                p_clin
-                p_vis
-                alpha_clin
-                alpha_vis
-
-        targets : torch.Tensor
-            Integer class labels.
-            Shape: [B].
-
-        Returns
-        -------
-        dict
-            total_loss
-                Complete HVNet training loss.
-
-            loss_final
-                Final prediction CE.
-
-            loss_clin
-                Clinical auxiliary CE.
-
-            loss_vis
-                Visual auxiliary CE.
-
-            loss_aux
-                Sum of the two auxiliary CEs.
-
-            kl_clin
-                Clinical evidential KL.
-
-            kl_vis
-                Visual evidential KL.
-
-            loss_edl
-                Sum of clinical and visual KL terms.
-
-            weighted_aux
-                lambda_aux * loss_aux.
-
-            weighted_edl
-                lambda_edl * loss_edl.
-        """
-
-        required_keys = [
-            "p_final",
-            "p_clin",
-            "p_vis",
-            "alpha_clin",
-            "alpha_vis",
+            transforms.RandomErasing(
+                p=random_erasing_prob,
+                scale=random_erasing_scale,
+                ratio=random_erasing_ratio,
+                value=0,
+            ),
         ]
+    )
 
-        missing_keys = [
-            key
-            for key in required_keys
-            if key not in outputs
+    return train_transform
+
+
+# ======================================================================
+# Validation / test transform
+# ======================================================================
+
+
+def build_eval_transform(
+    image_size: int = DEFAULT_IMAGE_SIZE,
+    imagenet_mean: Sequence[float] = IMAGENET_MEAN,
+    imagenet_std: Sequence[float] = IMAGENET_STD,
+) -> transforms.Compose:
+    """
+    Build deterministic preprocessing for validation and testing.
+
+    No random augmentation is performed.
+
+    Parameters
+    ----------
+    image_size : int
+        Final image size.
+
+        Manuscript configuration:
+            224
+
+    imagenet_mean : sequence
+        ImageNet normalization mean.
+
+    imagenet_std : sequence
+        ImageNet normalization standard deviation.
+
+    Returns
+    -------
+    torchvision.transforms.Compose
+        Validation / test transform pipeline.
+    """
+
+    if image_size <= 0:
+        raise ValueError(
+            "image_size must be greater than zero."
+        )
+
+    eval_transform = transforms.Compose(
+        [
+            # ======================================================
+            # Resize
+            # ======================================================
+
+            transforms.Resize(
+                (
+                    image_size,
+                    image_size,
+                )
+            ),
+
+            # ======================================================
+            # Convert to tensor
+            # ======================================================
+
+            transforms.ToTensor(),
+
+            # ======================================================
+            # ImageNet normalization
+            # ======================================================
+
+            transforms.Normalize(
+                mean=imagenet_mean,
+                std=imagenet_std,
+            ),
         ]
+    )
 
-        if missing_keys:
-            raise KeyError(
-                "HVNet outputs are missing required keys: "
-                + ", ".join(missing_keys)
-            )
+    return eval_transform
 
-        p_final = outputs["p_final"]
-        p_clin = outputs["p_clin"]
-        p_vis = outputs["p_vis"]
 
-        alpha_clin = outputs["alpha_clin"]
-        alpha_vis = outputs["alpha_vis"]
+# ======================================================================
+# Test transform
+# ======================================================================
 
-        # ==========================================================
-        # 1. Primary classification term
-        #
-        # CE(p_final, y)
-        # ==========================================================
 
-        loss_final = probability_cross_entropy(
-            probabilities=p_final,
-            targets=targets,
-            eps=self.eps,
-            reduction="mean",
-        )
+def build_test_transform(
+    image_size: int = DEFAULT_IMAGE_SIZE,
+    imagenet_mean: Sequence[float] = IMAGENET_MEAN,
+    imagenet_std: Sequence[float] = IMAGENET_STD,
+) -> transforms.Compose:
+    """
+    Alias for deterministic test-time preprocessing.
 
-        # ==========================================================
-        # 2. Auxiliary branch classification terms
-        #
-        # CE(p_clin, y)
-        # +
-        # CE(p_vis, y)
-        # ==========================================================
+    The test pipeline is intentionally identical to validation.
+    """
 
-        loss_clin = probability_cross_entropy(
-            probabilities=p_clin,
-            targets=targets,
-            eps=self.eps,
-            reduction="mean",
-        )
+    return build_eval_transform(
+        image_size=image_size,
+        imagenet_mean=imagenet_mean,
+        imagenet_std=imagenet_std,
+    )
 
-        loss_vis = probability_cross_entropy(
-            probabilities=p_vis,
-            targets=targets,
-            eps=self.eps,
-            reduction="mean",
-        )
 
-        loss_aux = (
-            loss_clin
-            + loss_vis
-        )
+# ======================================================================
+# Build all transforms
+# ======================================================================
 
-        # ==========================================================
-        # 3. Dirichlet evidential regularization
-        #
-        # KL^c + KL^v
-        # ==========================================================
 
-        kl_clin = evidential_kl_loss(
-            alpha=alpha_clin,
-            reduction="mean",
-        )
+def build_transforms(
+    image_size: int = DEFAULT_IMAGE_SIZE,
+    crop_scale: Tuple[float, float] = DEFAULT_RANDOM_CROP_SCALE,
 
-        kl_vis = evidential_kl_loss(
-            alpha=alpha_vis,
-            reduction="mean",
-        )
+    horizontal_flip_prob: float = 0.5,
 
-        loss_edl = (
-            kl_clin
-            + kl_vis
-        )
+    color_jitter_brightness: float = 0.2,
+    color_jitter_contrast: float = 0.2,
+    color_jitter_saturation: float = 0.2,
+    color_jitter_hue: float = 0.05,
 
-        # ==========================================================
-        # 4. Apply manuscript loss weights
-        # ==========================================================
+    randaugment_num_ops: int = 2,
+    randaugment_magnitude: int = 9,
 
-        weighted_aux = (
-            self.lambda_aux
-            * loss_aux
-        )
+    random_erasing_prob: float = 0.25,
+) -> Dict[str, transforms.Compose]:
+    """
+    Convenience function returning train, validation, and test transforms.
 
-        weighted_edl = (
-            self.lambda_edl
-            * loss_edl
-        )
+    Returns
+    -------
+    dict
 
-        # ==========================================================
-        # 5. Overall objective
-        #
-        # L =
-        #
-        # CE(p_final, y)
-        #
-        # + lambda_aux [
-        #       CE(p_clin, y)
-        #       +
-        #       CE(p_vis, y)
-        #   ]
-        #
-        # + lambda_edl [
-        #       KL_c
-        #       +
-        #       KL_v
-        #   ]
-        # ==========================================================
-
-        total_loss = (
-            loss_final
-            + weighted_aux
-            + weighted_edl
-        )
-
-        return {
-            "total_loss": total_loss,
-
-            "loss_final": loss_final,
-
-            "loss_clin": loss_clin,
-            "loss_vis": loss_vis,
-            "loss_aux": loss_aux,
-
-            "kl_clin": kl_clin,
-            "kl_vis": kl_vis,
-            "loss_edl": loss_edl,
-
-            "weighted_aux": weighted_aux,
-            "weighted_edl": weighted_edl,
+        {
+            "train": train_transform,
+            "val": validation_transform,
+            "test": test_transform,
         }
+    """
+
+    train_transform = build_train_transform(
+        image_size=image_size,
+        crop_scale=crop_scale,
+
+        horizontal_flip_prob=
+            horizontal_flip_prob,
+
+        color_jitter_brightness=
+            color_jitter_brightness,
+
+        color_jitter_contrast=
+            color_jitter_contrast,
+
+        color_jitter_saturation=
+            color_jitter_saturation,
+
+        color_jitter_hue=
+            color_jitter_hue,
+
+        randaugment_num_ops=
+            randaugment_num_ops,
+
+        randaugment_magnitude=
+            randaugment_magnitude,
+
+        random_erasing_prob=
+            random_erasing_prob,
+    )
+
+    validation_transform = build_eval_transform(
+        image_size=image_size,
+    )
+
+    test_transform = build_test_transform(
+        image_size=image_size,
+    )
+
+    return {
+        "train": train_transform,
+        "val": validation_transform,
+        "test": test_transform,
+    }
 
 
 # ======================================================================
-# Short alias
+# Denormalization utility
 # ======================================================================
 
-HVNetObjective = HVNetLoss
+
+def denormalize_imagenet(
+    image: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Reverse ImageNet normalization.
+
+    Useful for visualization, Grad-CAM overlays, or debugging.
+
+    Parameters
+    ----------
+    image : torch.Tensor
+
+        Supported shapes:
+
+            [3, H, W]
+
+        or:
+
+            [B, 3, H, W]
+
+    Returns
+    -------
+    torch.Tensor
+        Image tensor approximately restored to the [0, 1] range.
+    """
+
+    if image.ndim not in (
+        3,
+        4,
+    ):
+        raise ValueError(
+            "image must have shape [3, H, W] "
+            "or [B, 3, H, W]."
+        )
+
+    mean = torch.tensor(
+        IMAGENET_MEAN,
+        dtype=image.dtype,
+        device=image.device,
+    )
+
+    std = torch.tensor(
+        IMAGENET_STD,
+        dtype=image.dtype,
+        device=image.device,
+    )
+
+    if image.ndim == 3:
+
+        mean = mean.view(
+            3,
+            1,
+            1,
+        )
+
+        std = std.view(
+            3,
+            1,
+            1,
+        )
+
+    else:
+
+        mean = mean.view(
+            1,
+            3,
+            1,
+            1,
+        )
+
+        std = std.view(
+            1,
+            3,
+            1,
+            1,
+        )
+
+    restored = (
+        image * std
+        + mean
+    )
+
+    restored = restored.clamp(
+        0.0,
+        1.0,
+    )
+
+    return restored
+
+
+# ======================================================================
+# Short aliases
+# ======================================================================
+
+get_train_transform = build_train_transform
+get_val_transform = build_eval_transform
+get_test_transform = build_test_transform
 
 
 # ======================================================================
@@ -665,133 +594,74 @@ HVNetObjective = HVNetLoss
 
 if __name__ == "__main__":
 
-    torch.manual_seed(42)
-
-    batch_size = 4
-    num_classes = 3
+    from PIL import Image
 
     # --------------------------------------------------------------
-    # Example predictive distributions
-    # --------------------------------------------------------------
-
-    p_final = torch.softmax(
-        torch.randn(
-            batch_size,
-            num_classes,
-        ),
-        dim=-1,
-    )
-
-    p_clin = torch.softmax(
-        torch.randn(
-            batch_size,
-            num_classes,
-        ),
-        dim=-1,
-    )
-
-    p_vis = torch.softmax(
-        torch.randn(
-            batch_size,
-            num_classes,
-        ),
-        dim=-1,
-    )
-
-    # --------------------------------------------------------------
-    # Example Dirichlet parameters
+    # Artificial RGB image.
     #
-    # alpha = softplus(z) + 1
+    # This block does not access clinical data.
     # --------------------------------------------------------------
 
-    logits_clin = torch.randn(
-        batch_size,
-        num_classes,
+    example_image = Image.new(
+        mode="RGB",
+        size=(
+            512,
+            512,
+        ),
+        color=(
+            128,
+            128,
+            128,
+        ),
     )
 
-    logits_vis = torch.randn(
-        batch_size,
-        num_classes,
+    transforms_dict = build_transforms(
+        image_size=224,
+        crop_scale=(
+            0.70,
+            1.00,
+        ),
     )
 
-    alpha_clin = (
-        F.softplus(
-            logits_clin
-        )
-        + 1.0
+    training_image = transforms_dict[
+        "train"
+    ](
+        example_image
     )
 
-    alpha_vis = (
-        F.softplus(
-            logits_vis
-        )
-        + 1.0
+    validation_image = transforms_dict[
+        "val"
+    ](
+        example_image
     )
 
-    targets = torch.tensor(
-        [
-            0,
-            1,
-            2,
-            1,
-        ],
-        dtype=torch.long,
-    )
-
-    outputs = {
-        "p_final": p_final,
-        "p_clin": p_clin,
-        "p_vis": p_vis,
-        "alpha_clin": alpha_clin,
-        "alpha_vis": alpha_vis,
-    }
-
-    criterion = HVNetLoss(
-        lambda_aux=0.3,
-        lambda_edl=0.1,
-    )
-
-    losses = criterion(
-        outputs=outputs,
-        targets=targets,
+    test_image = transforms_dict[
+        "test"
+    ](
+        example_image
     )
 
     print(
-        "Final CE:",
-        losses["loss_final"].item(),
+        "Training image shape:",
+        training_image.shape,
     )
 
     print(
-        "Clinical CE:",
-        losses["loss_clin"].item(),
+        "Validation image shape:",
+        validation_image.shape,
     )
 
     print(
-        "Visual CE:",
-        losses["loss_vis"].item(),
+        "Test image shape:",
+        test_image.shape,
+    )
+
+    restored = denormalize_imagenet(
+        validation_image
     )
 
     print(
-        "Clinical KL:",
-        losses["kl_clin"].item(),
-    )
-
-    print(
-        "Visual KL:",
-        losses["kl_vis"].item(),
-    )
-
-    print(
-        "Weighted auxiliary loss:",
-        losses["weighted_aux"].item(),
-    )
-
-    print(
-        "Weighted EDL loss:",
-        losses["weighted_edl"].item(),
-    )
-
-    print(
-        "Total HVNet loss:",
-        losses["total_loss"].item(),
+        "Denormalized range:",
+        float(restored.min()),
+        float(restored.max()),
     )
